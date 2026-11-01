@@ -2,7 +2,7 @@
 // @id              taskbar-jump-list-copy-pid
 // @name            Taskbar Jump List Copy PID
 // @description     Adds a "Copy PID" item to the taskbar jump list
-// @version         1.0
+// @version         1.0.1
 // @author          toshiotomikawa
 // @license         GPL-3.0-only
 // @include         explorer.exe
@@ -11,7 +11,8 @@
 // @compilerOptions -lcomctl32 -lole32 -loleaut32 -lruntimeobject
 // ==/WindhawkMod==
 
-// Source code is published under The GNU General Public License v3.0.
+// Copyright (c) 2026 toshiotomikawa
+// Source code is published under the GNU General Public License v3.0 only.
 //
 // Based on the "Taskbar Jump List Volume Control" mod by Ara
 // (https://github.com/ara-hwang/windhawk-taskbar-jump-list-volume-control),
@@ -24,7 +25,8 @@
 Adds a "Copy PID" item to the jump list that opens when you right-click a
 taskbar button on Windows 11. Clicking it copies the process ID of the app to
 the clipboard. If the app has windows in several processes, all of their PIDs
-are copied, separated by commas.
+are copied, separated by a comma and a space. The label defaults to
+"Copy PID" and can be changed in the mod settings.
 
 ## How it works
 
@@ -37,7 +39,7 @@ processes of the right-clicked button and copies to the clipboard, and in
 
 // ==WindhawkModSettings==
 /*
-- label: Copiar PID
+- label: Copy PID
   $name: Item label
 */
 // ==/WindhawkModSettings==
@@ -80,6 +82,7 @@ constexpr DWORD kMaxPids = 16;
 struct JumpListPidInfo {
     ULONGLONG hostWnd;
     DWORD count;
+    DWORD seq;
     DWORD pids[kMaxPids];
 };
 
@@ -165,18 +168,82 @@ std::wstring FormatPids(const DWORD* pids, DWORD count) {
 ////////////////////////////////////////////////////////////////////////////////
 // explorer.exe: taskbar integration.
 
-// PIDs of the app whose jump list was opened last. Only accessed from the
-// taskbar thread.
-std::vector<DWORD> g_targetPids;
+// One snapshot per jump list that was opened. A later button must not replace
+// the PIDs of a list that is still on screen. Only the taskbar thread touches
+// this.
+constexpr DWORD kSnapshotSlots = 8;
 
+struct PidSnapshot {
+    DWORD seq = 0;
+    std::vector<DWORD> pids;
+};
+
+PidSnapshot g_snapshots[kSnapshotSlots];
+DWORD g_nextSeq;
 HWND g_hostWnd;
 
-void* QueryViaVtable(void* object, void* vtable) {
-    void* ptr = object;
-    while (*(void**)ptr != vtable) {
-        ptr = (void**)ptr + 1;
+DWORD StorePids(const std::vector<DWORD>& pids) {
+    DWORD seq = ++g_nextSeq;
+    if (seq == 0) {
+        seq = ++g_nextSeq;
     }
-    return ptr;
+
+    PidSnapshot& slot = g_snapshots[seq % kSnapshotSlots];
+    slot.seq = seq;
+    slot.pids = pids;
+    return seq;
+}
+
+const std::vector<DWORD>* FindPids(DWORD seq) {
+    if (!seq) {
+        return nullptr;
+    }
+
+    const PidSnapshot& slot = g_snapshots[seq % kSnapshotSlots];
+    return slot.seq == seq ? &slot.pids : nullptr;
+}
+
+bool CanReadPointer(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(address, &info, sizeof(info)) ||
+        info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD)) {
+        return false;
+    }
+
+    switch (info.Protect & 0xFF) {
+        case PAGE_READONLY:
+        case PAGE_READWRITE:
+        case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Task items are often ITaskItem pointers into a larger object, so the vtable
+// we need sits a few pointers away. An unbounded walk runs off the object and
+// takes explorer.exe with it.
+void* QueryViaVtable(void* object, void* vtable) {
+    if (!object || !vtable) {
+        return nullptr;
+    }
+
+    void** base = (void**)object;
+    for (int distance = 0; distance < 16; distance++) {
+        int steps[] = {distance == 0 ? 0 : -distance, distance};
+        int count = distance == 0 ? 1 : 2;
+        for (int i = 0; i < count; i++) {
+            void** ptr = base + steps[i];
+            if (CanReadPointer(ptr) && *ptr == vtable) {
+                return ptr;
+            }
+        }
+    }
+
+    return nullptr;
 }
 
 using CWindowTaskItem_GetWindow_t = HWND(WINAPI*)(void* pThis);
@@ -187,6 +254,8 @@ CImmersiveTaskItem_GetAppWindow_t CImmersiveTaskItem_GetAppWindow;
 
 void* CImmersiveTaskItem_vftable;
 void* CImmersiveTaskItem_vftable_ITaskItem;
+void* CWindowTaskItem_vftable;
+void* CWindowTaskItem_vftable_ITaskItem;
 
 using CTaskGroup_GetNumItems_t = int(WINAPI*)(void* pThis);
 CTaskGroup_GetNumItems_t CTaskGroup_GetNumItems;
@@ -204,24 +273,61 @@ HDPA GetTaskItemsArray(void* taskGroup) {
             arrayOfIntPtrs[i] = &arrayOfInts[i];
         }
 
-        return CTaskGroup_GetNumItems(arrayOfIntPtrs);
+        // A value outside the probe array means this is not the expected
+        // one-line getter. Indexing with it would crash explorer.exe.
+        int raw = CTaskGroup_GetNumItems(arrayOfIntPtrs);
+        if (raw < 0 || raw >= kIntArraySize) {
+            return static_cast<size_t>(-1);
+        }
+        return static_cast<size_t>(raw);
     }();
+
+    if (offset == static_cast<size_t>(-1)) {
+        return nullptr;
+    }
 
     return (HDPA)((void**)taskGroup)[offset];
 }
 
 HWND GetWindowFromTaskItem(void* taskItem) {
-    if (!taskItem) {
+    if (!taskItem || !CanReadPointer(taskItem)) {
         return nullptr;
     }
 
-    if (*(void**)taskItem == CImmersiveTaskItem_vftable_ITaskItem) {
-        void* immersiveTaskItem =
-            QueryViaVtable(taskItem, CImmersiveTaskItem_vftable);
-        return CImmersiveTaskItem_GetAppWindow(immersiveTaskItem);
+    void* vtable = *(void**)taskItem;
+    if (vtable == CImmersiveTaskItem_vftable ||
+        vtable == CImmersiveTaskItem_vftable_ITaskItem) {
+        void* immersiveTaskItem = vtable == CImmersiveTaskItem_vftable
+                                      ? taskItem
+                                      : QueryViaVtable(taskItem,
+                                                       CImmersiveTaskItem_vftable);
+        return immersiveTaskItem ? CImmersiveTaskItem_GetAppWindow(
+                                       immersiveTaskItem)
+                                 : nullptr;
     }
 
-    return CWindowTaskItem_GetWindow(taskItem);
+    if (CWindowTaskItem_vftable && vtable == CWindowTaskItem_vftable) {
+        return CWindowTaskItem_GetWindow(taskItem);
+    }
+
+    if (CWindowTaskItem_vftable_ITaskItem &&
+        vtable == CWindowTaskItem_vftable_ITaskItem) {
+        void* windowTaskItem =
+            CWindowTaskItem_vftable
+                ? QueryViaVtable(taskItem, CWindowTaskItem_vftable)
+                : taskItem;
+        return windowTaskItem ? CWindowTaskItem_GetWindow(windowTaskItem)
+                              : nullptr;
+    }
+
+    // Without the window vtables, keep the previous call. With them, an
+    // unknown item (a pinned launcher, for example) is skipped instead of
+    // being treated as a CWindowTaskItem.
+    if (!CWindowTaskItem_vftable && !CWindowTaskItem_vftable_ITaskItem) {
+        return CWindowTaskItem_GetWindow(taskItem);
+    }
+
+    return nullptr;
 }
 
 bool IsProcessNamed(DWORD pid, PCWSTR name) {
@@ -243,37 +349,63 @@ bool IsProcessNamed(DWORD pid, PCWSTR name) {
     return result;
 }
 
-// UWP apps are hosted by ApplicationFrameHost.exe, the app itself owns a child
-// window of the frame.
+// UWP apps are hosted by ApplicationFrameHost.exe. The frame class is checked
+// first because OpenProcess fails on a higher-integrity process, and that
+// failure must not drop the PID of an elevated Win32 window.
+bool IsApplicationFrameWindow(HWND hWnd, DWORD pid) {
+    WCHAR className[64];
+    if (GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+        wcscmp(className, L"ApplicationFrameWindow") == 0) {
+        return true;
+    }
+
+    return IsProcessNamed(pid, L"ApplicationFrameHost.exe");
+}
+
 DWORD GetAppProcessId(HWND hWnd) {
     DWORD pid = 0;
     if (!GetWindowThreadProcessId(hWnd, &pid) || !pid) {
         return 0;
     }
 
-    if (!IsProcessNamed(pid, L"ApplicationFrameHost.exe")) {
+    if (!IsApplicationFrameWindow(hWnd, pid)) {
         return pid;
     }
 
     struct Param {
         DWORD framePid;
         DWORD appPid;
-    } param{pid, 0};
+        DWORD corePid;
+    } param{pid, 0, 0};
 
     EnumChildWindows(
         hWnd,
         [](HWND hChild, LPARAM lParam) -> BOOL {
             auto* param = (Param*)lParam;
             DWORD childPid = 0;
-            if (GetWindowThreadProcessId(hChild, &childPid) && childPid &&
-                childPid != param->framePid) {
+            if (!GetWindowThreadProcessId(hChild, &childPid) || !childPid ||
+                childPid == param->framePid) {
+                return TRUE;
+            }
+
+            if (!param->appPid) {
                 param->appPid = childPid;
+            }
+
+            WCHAR className[64];
+            if (GetClassName(hChild, className, ARRAYSIZE(className)) &&
+                wcscmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
+                param->corePid = childPid;
                 return FALSE;
             }
+
             return TRUE;
         },
         (LPARAM)&param);
 
+    if (param.corePid) {
+        return param.corePid;
+    }
     return param.appPid ? param.appPid : pid;
 }
 
@@ -289,6 +421,11 @@ std::vector<DWORD> GetProcessIdsFromTaskGroup(void* taskGroup) {
     }
 
     int count = DPA_GetPtrCount(taskItemsArray);
+    if (count < 0 || count > 256) {
+        Wh_Log(L"Unexpected task item count: %d", count);
+        return pids;
+    }
+
     for (int i = 0; i < count; i++) {
         HWND hWnd = GetWindowFromTaskItem(DPA_GetPtr(taskItemsArray, i));
         DWORD pid = hWnd ? GetAppProcessId(hWnd) : 0;
@@ -300,26 +437,48 @@ std::vector<DWORD> GetProcessIdsFromTaskGroup(void* taskGroup) {
     return pids;
 }
 
-void CopyTextToClipboard(HWND hWnd, const std::wstring& text) {
-    if (!OpenClipboard(hWnd)) {
-        Wh_Log(L"OpenClipboard failed: %u", GetLastError());
-        return;
+bool CopyTextToClipboard(HWND hWnd, const std::wstring& text) {
+    if (text.empty()) {
+        return false;
     }
-
-    EmptyClipboard();
 
     size_t bytes = (text.size() + 1) * sizeof(WCHAR);
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (memory) {
-        void* data = GlobalLock(memory);
-        memcpy(data, text.c_str(), bytes);
-        GlobalUnlock(memory);
-        if (!SetClipboardData(CF_UNICODETEXT, memory)) {
-            GlobalFree(memory);
-        }
+    if (!memory) {
+        Wh_Log(L"GlobalAlloc failed: %u", GetLastError());
+        return false;
     }
 
-    CloseClipboard();
+    void* data = GlobalLock(memory);
+    if (!data) {
+        GlobalFree(memory);
+        Wh_Log(L"GlobalLock failed: %u", GetLastError());
+        return false;
+    }
+
+    memcpy(data, text.c_str(), bytes);
+    GlobalUnlock(memory);
+
+    // Another program may hold the clipboard for a moment. Empty it only
+    // after the replacement text is ready, so a failure leaves the old
+    // contents in place.
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (OpenClipboard(hWnd)) {
+            bool stored = EmptyClipboard() &&
+                          SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+            CloseClipboard();
+            if (!stored) {
+                GlobalFree(memory);
+                Wh_Log(L"SetClipboardData failed: %u", GetLastError());
+            }
+            return stored;
+        }
+        Sleep(10);
+    }
+
+    GlobalFree(memory);
+    Wh_Log(L"OpenClipboard failed: %u", GetLastError());
+    return false;
 }
 
 void CloseJumpList() {
@@ -337,15 +496,20 @@ LRESULT CALLBACK HostWndProc(HWND hWnd,
                              WPARAM wParam,
                              LPARAM lParam) {
     switch (uMsg) {
-        case kMsgCopyPids:
-            if (!g_targetPids.empty()) {
-                std::wstring text =
-                    FormatPids(g_targetPids.data(), (DWORD)g_targetPids.size());
-                CopyTextToClipboard(hWnd, text);
-                Wh_Log(L"Copied: %s", text.c_str());
+        case kMsgCopyPids: {
+            const std::vector<DWORD>* pids = FindPids((DWORD)wParam);
+            if (!pids || pids->empty()) {
+                Wh_Log(L"No PIDs for seq %u", (DWORD)wParam);
+                return 0;
             }
-            CloseJumpList();
+
+            std::wstring text = FormatPids(pids->data(), (DWORD)pids->size());
+            if (CopyTextToClipboard(hWnd, text)) {
+                Wh_Log(L"Copied: %s", text.c_str());
+                CloseJumpList();
+            }
             return 0;
+        }
     }
 
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
@@ -390,17 +554,19 @@ void OnShowJumpView(void* taskGroup) {
         return;
     }
 
-    g_targetPids = GetProcessIdsFromTaskGroup(taskGroup);
+    std::vector<DWORD> pids = GetProcessIdsFromTaskGroup(taskGroup);
+    DWORD seq = StorePids(pids);
 
     JumpListPidInfo info{};
     info.hostWnd = (ULONGLONG)(ULONG_PTR)g_hostWnd;
-    info.count = (DWORD)std::min<size_t>(g_targetPids.size(), kMaxPids);
+    info.seq = seq;
+    info.count = (DWORD)std::min<size_t>(pids.size(), kMaxPids);
     for (DWORD i = 0; i < info.count; i++) {
-        info.pids[i] = g_targetPids[i];
+        info.pids[i] = pids[i];
     }
 
     Wh_Log(L"Jump list: pids=%s",
-           FormatPids(info.pids, info.count).c_str());
+           FormatPids(pids.data(), (DWORD)pids.size()).c_str());
 
     HWND shellWnd =
         FindWindowEx(HWND_MESSAGE, nullptr, kShellWndClass, nullptr);
@@ -440,10 +606,11 @@ HRESULT WINAPI CTaskListWnd_ShowJumpView_Hook(void* pThis,
 }
 
 bool HookTaskbarDllSymbols() {
-    HMODULE module =
-        LoadLibraryEx(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    // taskbar.dll is already loaded in explorer.exe. LoadLibrary would add a
+    // reference that Wh_ModUninit never releases.
+    HMODULE module = GetModuleHandle(L"taskbar.dll");
     if (!module) {
-        Wh_Log(L"Couldn't load taskbar.dll");
+        Wh_Log(L"taskbar.dll is not loaded");
         return false;
     }
 
@@ -473,6 +640,18 @@ bool HookTaskbarDllSymbols() {
             {LR"(const CImmersiveTaskItem::`vftable'{for `ITaskItem'})"},
             &CImmersiveTaskItem_vftable_ITaskItem,
         },
+        {
+            {LR"(const CWindowTaskItem::`vftable')"},
+            &CWindowTaskItem_vftable,
+            nullptr,
+            true,
+        },
+        {
+            {LR"(const CWindowTaskItem::`vftable'{for `ITaskItem'})"},
+            &CWindowTaskItem_vftable_ITaskItem,
+            nullptr,
+            true,
+        },
     };
 
     return WindhawkUtils::HookSymbols(module, taskbarDllHooks,
@@ -494,10 +673,12 @@ constexpr int kPollCount = 40;
 HANDLE g_shellThread;
 std::atomic<HWND> g_shellWnd;
 std::atomic<HWND> g_pidHostWnd;
+std::atomic<DWORD> g_hostSeq;
 
 // Written on the Windhawk engine thread, read on the jump list UI thread.
+SRWLOCK g_labelLock = SRWLOCK_INIT;
 std::atomic<bool> g_labelChanged;
-WCHAR g_label[64] = L"Copiar PID";
+WCHAR g_label[64] = L"Copy PID";
 
 // Accessed from the mod's window thread, and from the jump list UI thread
 // while the former is blocked waiting for it.
@@ -549,7 +730,8 @@ std::atomic<DWORD> g_uiThreadId;
 bool g_headerUnsupported;
 
 void RequestCopy() {
-    if (!PostMessage(g_pidHostWnd, kMsgCopyPids, 0, 0)) {
+    // The seq selects the snapshot taken when this jump list opened.
+    if (!PostMessage(g_pidHostWnd, kMsgCopyPids, g_hostSeq.load(), 0)) {
         Wh_Log(L"PostMessage failed: %u", GetLastError());
     }
 }
@@ -994,9 +1176,15 @@ bool ApplyOnUiThread() {
 
     StyleLikeListItems(list);
 
-    if (g_ui.appliedSeq != g_info.seq || g_labelChanged.exchange(false)) {
+    if (g_ui.labelText &&
+        (g_ui.appliedSeq != g_info.seq || g_labelChanged.exchange(false))) {
+        WCHAR label[64];
+        AcquireSRWLockShared(&g_labelLock);
+        wcscpy_s(label, g_label);
+        ReleaseSRWLockShared(&g_labelLock);
+
         g_ui.appliedSeq = g_info.seq;
-        g_ui.labelText.Text(g_label);
+        g_ui.labelText.Text(label);
         g_ui.root.Visibility(g_info.count ? Visibility::Visible
                                           : Visibility::Collapsed);
     }
@@ -1078,14 +1266,21 @@ LRESULT CALLBACK ShellWndProc(HWND hWnd,
                               LPARAM lParam) {
     switch (uMsg) {
         case WM_COPYDATA: {
+            if (!lParam || !wParam) {
+                return FALSE;
+            }
+
             auto* cds = (const COPYDATASTRUCT*)lParam;
-            if (cds->dwData != kCopyDataMagic ||
+            if (!cds->lpData || cds->dwData != kCopyDataMagic ||
                 cds->cbData != sizeof(JumpListPidInfo)) {
                 return FALSE;
             }
 
             auto* info = (const JumpListPidInfo*)cds->lpData;
-            g_pidHostWnd = (HWND)(ULONG_PTR)info->hostWnd;
+            // wParam is the explorer window that sent this message. The copy
+            // goes back to that window, not to a HWND carried in the payload.
+            g_pidHostWnd = (HWND)wParam;
+            g_hostSeq = info->seq;
             g_info.count = std::min(info->count, kMaxPids);
             for (DWORD i = 0; i < g_info.count; i++) {
                 g_info.pids[i] = info->pids[i];
@@ -1189,11 +1384,13 @@ DWORD WINAPI ShellThreadProc(LPVOID readyEvent) {
 
 void LoadSettings() {
     PCWSTR label = Wh_GetStringSetting(L"label");
+    AcquireSRWLockExclusive(&g_labelLock);
     if (label && *label) {
         wcsncpy_s(g_label, label, _TRUNCATE);
     } else {
-        wcscpy_s(g_label, L"Copiar PID");
+        wcscpy_s(g_label, L"Copy PID");
     }
+    ReleaseSRWLockExclusive(&g_labelLock);
     Wh_FreeStringSetting(label);
     g_labelChanged = true;
 }
